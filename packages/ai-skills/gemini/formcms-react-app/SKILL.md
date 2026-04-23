@@ -7,30 +7,116 @@ description: Guidelines and patterns for building React applications that integr
 
 This skill outlines the standard patterns for connecting a React frontend to a FormCMS backend.
 
-## 1. Configuration
+## Configuration
 
-FormCMS apps typically require an API base URL configuration. Use Vite's environment variables.
+FormCMS apps typically communicate with the backend via API. To avoid CORS issues during development, use a proxy in your Vite configuration instead of hardcoding an API base URL.
 
-### `src/config.ts`
+### `vite.config.ts`
 ```typescript
-export const CONFIG = {
-    API_BASE_URL: import.meta.env.VITE_API_BASE_URL || ''
-};
-```
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
 
-Ensure your `.env` or `.env.local` contains:
-```
-VITE_API_BASE_URL=http://localhost:3000
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    proxy: {
+      // In Docker, nginx (default port 5000) is the single gateway:
+      //   /api/ → .NET FormCMS backend
+      //   /mcp/ → MCP server
+      // Point the proxy target at your Docker nginx URL.
+      '/api': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+      },
+      '/mcp': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+      }
+    }
+  }
+});
 ```
 
 ---
 
-## 2. Authentication
+## Authentication
 
-FormCMS uses **cookie-based session authentication**. Every `fetch` call MUST include
-`credentials: 'include'` so the browser sends/receives the session cookie.
+FormCMS uses **cookie-based session authentication** via axios.
 
-### Endpoints
+### Setup (`src/main.tsx` or `src/App.tsx`)
+
+```typescript
+import axios from 'axios';
+// Must be set globally — ensures cookies are sent on every request
+axios.defaults.withCredentials = true;
+```
+
+### Auth service (`src/services/auth.ts`)
+
+Use axios directly and wrap calls with `catchClient` to return `{ data } | { error, errorDetail }` instead of throwing:
+
+```typescript
+import axios from 'axios';
+import useSWR from 'swr';
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+const fetcher = (url: string) => axios.get(url).then(r => r.data);
+
+export async function catchClient<T>(req: () => Promise<T>) {
+  try {
+    return { data: await req() };
+  } catch (err: any) {
+    const title = err.response?.data?.title ?? 'An error has occurred.';
+    return { error: title, errorDetail: err.response?.data };
+  }
+}
+
+// ── Session ────────────────────────────────────────────────────────────────
+// SWR caches the session; returns undefined while loading, null when logged out
+export function useUserInfo() {
+  return useSWR('/api/me', fetcher, { revalidateOnFocus: false, shouldRetryOnError: false });
+}
+
+// ── Auth actions (these return no data — just check for success) ──────────
+export const login    = (payload: { usernameOrEmail: string; password: string }) =>
+  catchClient(() => axios.post('/api/login', payload));
+
+export const register = (payload: { email: string; password: string; userName: string }) =>
+  catchClient(() => axios.post('/api/register', payload));
+
+export const logout   = () =>
+  catchClient(() => axios.get('/api/logout'));
+```
+
+### Consuming in a component
+
+```tsx
+import { useUserInfo, login, logout } from '../services/auth';
+
+export function App() {
+  const { data: userInfo, isLoading, mutate } = useUserInfo();
+
+  const handleLogin = async (usernameOrEmail: string, password: string) => {
+    const res = await login({ usernameOrEmail, password });
+    if (res.error) {
+      setError(res.errorDetail?.title || res.error);
+    } else {
+      await mutate(); // re-fetch /api/me to hydrate session
+    }
+  };
+
+  const handleLogout = async () => {
+    await logout();
+    await mutate(null, false); // clear cached user without refetch
+  };
+
+  if (isLoading) return <Spinner />;
+  if (!userInfo) return <LoginForm onSubmit={handleLogin} />;
+  return <Dashboard user={userInfo} onLogout={handleLogout} />;
+}
+```
+
+### Auth Endpoints
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -41,115 +127,16 @@ FormCMS uses **cookie-based session authentication**. Every `fetch` call MUST in
 | `POST` | `/api/profile/password` | Change password — body: `{ oldPassword, password }` |
 | `POST` | `/api/profile/avatar` | Upload avatar — `multipart/form-data`, field name `file` |
 
-### AuthContext Pattern (`src/contexts/AuthContext.tsx`)
-
-```tsx
-import { createContext, useContext, useEffect, useState, ReactNode } from 'react';
-import { CONFIG } from '../config';
-
-interface User {
-  id: string | number;
-  username: string;
-  email?: string;
-  avatarUrl?: string | null;
-  roles?: string[];
-}
-
-interface AuthContextValue {
-  user: User | null;
-  loading: boolean;
-  login: (usernameOrEmail: string, password: string) => Promise<void>;
-  register: (email: string, password: string, userName: string) => Promise<void>;
-  logout: () => Promise<void>;
-}
-
-const AuthContext = createContext<AuthContextValue | null>(null);
-
-export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  // Restore existing session on mount
-  useEffect(() => {
-    fetch(`${CONFIG.API_BASE_URL}/api/me`, { credentials: 'include' })
-      .then(r => r.ok ? r.json() : null)
-      .then(data => setUser(data
-        ? { id: data.id, username: data.name ?? data.email, email: data.email, avatarUrl: data.avatarUrl, roles: data.roles }
-        : null
-      ))
-      .finally(() => setLoading(false));
-  }, []);
-
-  const login = async (usernameOrEmail: string, password: string) => {
-    const res = await fetch(`${CONFIG.API_BASE_URL}/api/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',   // CRITICAL — cookie will not be set without this
-      body: JSON.stringify({ usernameOrEmail, password }),
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const data = await res.json();
-    setUser({ id: data.id, username: data.name ?? data.email, email: data.email, avatarUrl: data.avatarUrl, roles: data.roles });
-  };
-
-  const register = async (email: string, password: string, userName: string) => {
-    const res = await fetch(`${CONFIG.API_BASE_URL}/api/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ email, password, userName }),
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const data = await res.json();
-    setUser({ id: data.id, username: data.name ?? data.email, email: data.email, avatarUrl: data.avatarUrl, roles: data.roles });
-  };
-
-  const logout = async () => {
-    await fetch(`${CONFIG.API_BASE_URL}/api/logout`, { credentials: 'include' });
-    setUser(null);
-  };
-
-  return (
-    <AuthContext.Provider value={{ user, loading, login, register, logout }}>
-      {children}
-    </AuthContext.Provider>
-  );
-}
-
-export const useAuth = () => {
-  const ctx = useContext(AuthContext);
-  if (!ctx) throw new Error('useAuth must be used inside <AuthProvider>');
-  return ctx;
-};
-```
-
-### Wrap app in `src/main.tsx`
-```tsx
-import { AuthProvider } from './contexts/AuthContext';
-root.render(<AuthProvider><App /></AuthProvider>);
-```
-
-### Use in components
-```tsx
-const { user, login, logout, loading } = useAuth();
-if (loading) return <Spinner />;
-if (!user) return <LoginForm onSubmit={login} />;
-return <Dashboard user={user} onLogout={logout} />;
-```
-
 ### Key Rules
-- Always pass `credentials: 'include'` on **every** fetch/axios call.
-- After login or register, the session cookie is set automatically — no token storage needed.
-- Use `GET /api/me` on app startup to restore an existing session.
-- `roles` on User controls access (e.g. `'admin'`).
+- Set `axios.defaults.withCredentials = true` **once** at app startup — applies to all requests.
+- Auth calls return `{ data } | { error, errorDetail }` — always check `res.error`, never rely on thrown exceptions.
+- Use SWR's `mutate()` after login/logout to sync the cached session without a full page reload.
+- `userInfo.roles` controls access (e.g. `'admin'`).
 
 ---
 
-## 3. Data Fetching
+## Entity API
 
-Interacting with FormCMS data involves two main API types: **Entity APIs** and **Named Queries**.
-
-### Entity API
 Used for standard CRUD operations on entities.
 
 | Method | Endpoint | Purpose |
@@ -160,28 +147,51 @@ Used for standard CRUD operations on entities.
 | `POST` | `/api/entities/{entity}/update` | Update |
 | `POST` | `/api/entities/{entity}/delete` | Delete |
 
+### List response shape
+
+```json
+{
+  "items": [
+    { "id": 1, "title": "...", "published": "true", "publicationStatus": "published", "createdAt": "...", "updatedAt": "..." }
+  ],
+  "totalRecords": 100
+}
+```
+
+> Note: `published` is a string `"true"` / `"false"`, not a boolean.
+
+Example (List with filters):
+```typescript
+const res = await axios.get('/api/entities/post', {
+  params: { limit: 10, offset: 0 },
+});
+const { items, totalRecords } = res.data;
+```
+
 Example (Insert):
 ```typescript
-await fetch(`${CONFIG.API_BASE_URL}/api/entities/goal/insert`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify({ targetValue: 5, title: 'New Goal' }),
+await axios.post('/api/entities/post/insert', {
+  title: 'New Post',
+  published: 'true',
 });
 ```
 
-### Named Queries
+## Named Queries
+
 Used for fetching specific data sets defined in FormCMS.
+
 Endpoint: `GET /api/queries/{queryName}?param=value`
 
 ```typescript
-const response = await fetch(`${CONFIG.API_BASE_URL}/api/queries/habitTemplateList?limit=10`);
-const data = await response.json();
+const res = await axios.get('/api/queries/habitTemplateList', {
+  params: { limit: 10 },
+});
+const data = res.data;
 ```
 
 ---
 
-## 4. UI Best Practices (Zen Aesthetic)
+## UI Best Practices
 - Use **Lucide React** for icons.
 - Use **Framer Motion** for transitions.
 - Maintain a clean, minimal aesthetic with consistent spacing.
